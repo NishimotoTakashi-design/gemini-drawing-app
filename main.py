@@ -1,19 +1,29 @@
 import streamlit as st
-from google import genai
-from google.genai import types
 import json
+import io
+
+# Import the new Google GenAI SDK
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    st.error("Error: 'google-genai' library not found. Please ensure it's in requirements.txt and reboot the app.")
 
 # ==========================================
-# 1. Security & Client Settings
+# 1. Access Control (Security)
 # ==========================================
 def check_password():
+    """Simple password authentication for access control"""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
 
     if not st.session_state["password_correct"]:
         st.title("🔒 Access Restricted")
-        password = st.text_input("Please enter the application password", type="password")
+        st.write("Please log in to use the AI Drawing Analyzer.")
+        
+        password = st.text_input("Password", type="password")
         if st.button("Login"):
+            # Set your password in Streamlit Cloud Secrets as APP_PASSWORD
             if password == st.secrets.get("APP_PASSWORD", "admin123"):
                 st.session_state["password_correct"] = True
                 st.rerun()
@@ -22,43 +32,44 @@ def check_password():
         return False
     return True
 
-# Initialize Gemini Client with Region (us-central1)
+# Initialize Gemini Client with us-central1
 def get_gemini_client():
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
-        st.error("API Key not found in Secrets.")
+        st.error("API Key missing in Secrets.")
         st.stop()
     
-    # Setting location to us-central1
+    # Initialize client with the specific location
     return genai.Client(
         api_key=api_key,
         location="us-central1"
     )
 
-client = get_gemini_client()
-
 # ==========================================
 # 2. Main Logic (Drawing Analysis)
 # ==========================================
-def analyze_drawing(file_bytes, mime_type, target_columns, customer_info, component_info):
-    """Extracts information using Gemini 2.5 Pro in us-central1"""
+def analyze_drawing(client, file_bytes, mime_type, target_columns, customer_info, component_info):
+    """Extracts information using Gemini 2.5 Pro"""
     
-    # Instructions including context for Harness/Connectors
+    # Detailed prompt for Harness/Connector extraction
     prompt = f"""
     Context:
     - Customer Overview: {customer_info}
-    - Component Details (e.g., Harness, Connector): {component_info}
+    - Component Details (e.g., Harness, Connector, PCB): {component_info}
 
     Task:
-    Analyze the attached document and extract the following items in a JSON object.
-    Target Items: {target_columns}
+    Analyze the attached technical drawing and extract the specific information requested below.
     
-    Instructions:
-    - If data is missing, use null.
-    - Provide ONLY valid JSON.
+    Target Items to Extract:
+    {target_columns}
+    
+    Formatting Instructions:
+    - Provide the result ONLY in a valid JSON object.
+    - If a specific piece of information is not found in the drawing, set the value to null.
+    - Ensure keys match the 'Target Items' exactly.
     """
     
-    # Call Gemini 2.5 Pro
+    # Generate content using Gemini 2.5 Pro
     response = client.models.generate_content(
         model="gemini-2.5-pro",
         contents=[
@@ -69,53 +80,73 @@ def analyze_drawing(file_bytes, mime_type, target_columns, customer_info, compon
     return response.text
 
 # ==========================================
-# 3. UI Construction
+# 3. Streamlit UI
 # ==========================================
-st.set_page_config(page_title="AI Drawing Analyzer (Gemini 2.5 Pro)", layout="wide")
+st.set_page_config(page_title="Gemini 2.5 Pro Drawing Analyzer", layout="wide")
 
 if check_password():
-    st.title("📄 AI Drawing Data Structurizer")
-    st.info("Current Model: Gemini 2.5 Pro | Region: us-central1")
+    client = get_gemini_client()
     
-    st.sidebar.header("Configuration")
+    st.title("📄 AI Drawing Data Structurizer")
+    st.caption("Powered by Gemini 2.5 Pro | Region: us-central1")
+    
+    # Sidebar: Config
+    st.sidebar.header("Data Extraction Settings")
     target_columns = st.sidebar.text_area(
-        "Target Columns",
-        "Part Number, Revision, Material, Connector Type, Wire Gauge, Pin Assignment, Manufacturer"
+        "Target Columns (Comma separated)",
+        "Part Number, Revision, Material, Connector Type, Wire Gauge, Pin Assignment, Manufacturer, Weight",
+        height=150
     )
 
+    # Input Fields for Context
+    st.subheader("1. Provide Context")
     col1, col2 = st.columns(2)
     with col1:
-        customer_overview = st.text_input("Customer Overview", placeholder="e.g., Automotive OEM")
+        customer_overview = st.text_input("Customer Overview", placeholder="e.g., Major Automotive OEM")
     with col2:
-        component_details = st.text_input("Component Context", placeholder="e.g., Wire Harness for Door")
+        component_details = st.text_input("Component Type", placeholder="e.g., Engine Wire Harness, Board-to-Board Connector")
 
+    # File Upload
+    st.subheader("2. Upload Drawing")
     uploaded_file = st.file_uploader(
-        "Upload Drawing (PDF, TIFF, Image)", 
+        "Supported formats: PDF, TIFF, PNG, JPG", 
         type=["pdf", "tif", "tiff", "png", "jpg", "jpeg"]
     )
 
-    if st.button("Run Extraction") and uploaded_file:
-        with st.spinner("Analyzing with Gemini 2.5 Pro..."):
+    if st.button("🚀 Run AI Analysis") and uploaded_file:
+        with st.spinner("Gemini is analyzing the drawing... (This may take a moment for large files)"):
             try:
-                # Get file info
+                # Prepare data
                 file_bytes = uploaded_file.getvalue()
                 mime_type = uploaded_file.type
                 
-                # Execute analysis
+                # Analysis
                 result_text = analyze_drawing(
-                    file_bytes, mime_type, target_columns, customer_overview, component_details
+                    client, file_bytes, mime_type, target_columns, customer_overview, component_details
                 )
                 
-                # Result Display
-                st.subheader("Results")
+                # Output
+                st.subheader("3. Results")
+                
                 try:
-                    # JSON Cleanup (handling potential markdown formatting)
-                    clean_json = result_text.strip().replace("```json", "").replace("```", "")
+                    # Clean the AI output to ensure it's valid JSON
+                    clean_json = result_text.strip()
+                    if clean_json.startswith("```json"):
+                        clean_json = clean_json[7:-3]
+                    elif clean_json.startswith("```"):
+                        clean_json = clean_json[3:-3]
+                    
                     data_dict = json.loads(clean_json)
+                    
+                    # Display as Table and JSON
+                    st.success("Extraction successful!")
                     st.table([data_dict])
-                    st.json(data_dict)
-                except:
-                    st.text_area("Raw Response", result_text, height=300)
+                    with st.expander("View Raw JSON Output"):
+                        st.json(data_dict)
+                        
+                except Exception as json_err:
+                    st.warning("Could not format output as a table. Showing raw response:")
+                    st.text_area("Raw AI Response", result_text, height=400)
                     
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Analysis Error: {str(e)}")
