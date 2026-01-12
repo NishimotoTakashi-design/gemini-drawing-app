@@ -34,8 +34,8 @@ def init_vertex_ai():
 # 2. Parallel Analysis Logic
 # ==========================================
 def call_gemini_vertex(file_bytes, mime_type, target_instructions, customer_info, component_info):
-    # Using Gemini 1.5 Pro (Optimized for technical drawings)
-    model = GenerativeModel("gemini-1.5-pro-002")
+    # Using Gemini 2.5 Pro (Optimized for technical drawings)
+    model = GenerativeModel("gemini-2.5-pro")
     
     prompt = f"""
     Context:
@@ -168,3 +168,4 @@ if init_vertex_ai():
                 status_text.empty()
         else:
             st.warning("Please upload a file and define extraction items.")
+
