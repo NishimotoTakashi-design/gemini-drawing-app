@@ -2,170 +2,171 @@ import streamlit as st
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part
 from google.oauth2 import service_account
+from googleapiclient.discovery import build
 import json
 import time
 import re
+import pandas as pd
+from datetime import datetime
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
-# 1. Vertex AI Auth (No Password Required)
+# 1. Vertex AI & Google API Auth
 # ==========================================
 @st.cache_resource
-def init_vertex_ai():
+def get_credentials():
     try:
-        # Construct credentials from Streamlit Secrets
-        if "gcp_service_account" not in st.secrets:
-            st.error("GCP Service Account info not found in Secrets.")
-            return False
-            
         info = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(info)
-        vertexai.init(
-            project=info["project_id"],
-            location="us-central1",
-            credentials=creds
+        return service_account.Credentials.from_service_account_info(
+            info, 
+            scopes=["https://www.googleapis.com/auth/cloud-platform", 
+                    "https://www.googleapis.com/auth/drive", 
+                    "https://www.googleapis.com/auth/spreadsheets"]
         )
+    except Exception as e:
+        st.error(f"Credentials Error: {e}")
+        return None
+
+def init_vertex_ai(creds):
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+        vertexai.init(project=info["project_id"], location="us-central1", credentials=creds)
         return True
     except Exception as e:
-        st.error(f"Failed to initialize Vertex AI: {e}")
+        st.error(f"Vertex AI Init Error: {e}")
         return False
 
 # ==========================================
-# 2. Parallel Analysis Logic
+# 2. Google Drive / Sheets Functions
+# ==========================================
+def save_to_google_sheets(creds, folder_id, data_dict):
+    try:
+        drive_service = build('drive', 'v3', credentials=creds)
+        sheets_service = build('sheets', 'v4', credentials=creds)
+        
+        # 1. Create Spreadsheet
+        date_str = datetime.now().strftime("%Y%m%d_%H%M")
+        file_metadata = {
+            'name': f'Drawing_Analysis_{date_str}',
+            'mimeType': 'application/vnd.google-apps.spreadsheet',
+            'parents': [folder_id] if folder_id else []
+        }
+        spreadsheet = drive_service.files().create(body=file_metadata, fields='id').execute()
+        spreadsheet_id = spreadsheet.get('id')
+        
+        # 2. Prepare Data (Header & Values)
+        headers = list(data_dict.keys())
+        values = [list(data_dict.values())]
+        body = {'values': [headers] + values}
+        
+        # 3. Write to Sheet
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range="Sheet1!A1",
+            valueInputOption="RAW",
+            body=body
+        ).execute()
+        
+        return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# ==========================================
+# 3. AI Analysis Logic
 # ==========================================
 def call_gemini_vertex(file_bytes, mime_type, target_instructions, customer_info, component_info):
-    # Using Gemini 2.5 Pro (Optimized for technical drawings)
     model = GenerativeModel("gemini-2.5-pro")
-    
     prompt = f"""
-    Context:
-    - Customer Overview: {customer_info}
-    - Component Details: {component_info}
-    
-    Task: Analyze the attached drawing and extract the following items into a valid JSON object.
-    Specific Extraction Instructions:
+    Context: {customer_info}, {component_info}
+    Extract drawing data as JSON:
     {target_instructions}
-    
-    Rules: 
-    - Return ONLY a valid JSON object.
-    - If information is missing, use null.
+    - Return ONLY valid JSON.
     """
     doc_part = Part.from_data(data=file_bytes, mime_type=mime_type)
     response = model.generate_content([doc_part, prompt])
     return response.text
 
 # ==========================================
-# 3. UI Construction
+# 4. Main UI
 # ==========================================
-st.set_page_config(page_title="AI Drawing Analyzer Pro", layout="wide")
+st.set_page_config(page_title="Drawing Analyzer Pro", layout="wide")
+creds = get_credentials()
 
-# App starts directly without password check
-if init_vertex_ai():
+if creds and init_vertex_ai(creds):
     st.title("📄 AI Drawing Data Structurizer")
-    st.caption("Engine: Vertex AI (Gemini 1.5 Pro Optimized) | Region: us-central1")
 
-    # --- 1. Provide Context & Extraction Settings ---
-    st.subheader("1. Provide Context & Extraction Settings")
-    col_c1, col_c2 = st.columns(2)
-    with col_c1:
-        customer_overview = st.text_input("Customer Overview", placeholder="e.g., Major OEM")
-    with col_c2:
-        component_details = st.text_input("Component Type", placeholder="e.g., Wire Harness")
+    # --- Settings ---
+    st.subheader("1. Extraction & Storage Settings")
+    col1, col2 = st.columns(2)
+    with col1:
+        customer_overview = st.text_input("Customer Overview")
+        drive_folder_id = st.text_input("Google Drive Folder ID (Optional)", help="Enter the ID from the URL of your Drive folder")
+    with col2:
+        component_details = st.text_input("Component Type")
 
-    st.write("### Extraction Settings")
-    
-    # Session state for dynamic rows
+    # Dynamic Rows
     if 'rows' not in st.session_state:
-        st.session_state.rows = [
-            {"item": "Part Number", "guide": "Found in title block at bottom right"},
-            {"item": "Material", "guide": "Found in general notes section"}
-        ]
+        st.session_state.rows = [{"item": "Part Number", "guide": "Bottom right block"}]
+    
+    col_b1, col_b2, _ = st.columns([1,1,4])
+    if col_b1.button("➕ Add Row"): st.session_state.rows.append({"item": "", "guide": ""})
+    if col_b2.button("➖ Remove Row"): st.session_state.rows.pop()
 
-    # Row controls
-    col_btn1, col_btn2, _ = st.columns([1, 1, 4])
-    if col_btn1.button("➕ Add Row"):
-        st.session_state.rows.append({"item": "", "guide": ""})
-    if col_btn2.button("➖ Remove Last Row") and len(st.session_state.rows) > 0:
-        st.session_state.rows.pop()
-
-    # Display input rows
     extracted_instructions = []
     for i, row in enumerate(st.session_state.rows):
-        r_col1, r_col2 = st.columns([1, 2])
-        with r_col1:
-            item_name = st.text_input(f"Item Name {i+1}", value=row['item'], key=f"item_{i}")
-        with r_col2:
-            item_guide = st.text_input(f"Extraction Guide {i+1}", value=row['guide'], key=f"guide_{i}")
-        st.session_state.rows[i] = {"item": item_name, "guide": item_guide}
-        if item_name:
-            extracted_instructions.append(f"- {item_name}: Find it based on: {item_guide}")
+        c1, c2 = st.columns([1, 2])
+        item = c1.text_input(f"Item {i+1}", value=row['item'], key=f"it_{i}")
+        gd = c2.text_input(f"Guide {i+1}", value=row['guide'], key=f"gd_{i}")
+        if item: extracted_instructions.append(f"- {item}: {gd}")
 
-    target_instructions_str = "\n".join(extracted_instructions)
-
-    # --- 2. Upload Drawing ---
+    # --- Upload ---
     st.subheader("2. Upload Drawing")
-    uploaded_file = st.file_uploader("Upload Drawing", type=["pdf", "tif", "tiff", "png", "jpg", "jpeg"])
-    
-    file_bytes = None
-    mime_type = None
-    if uploaded_file:
+    uploaded_file = st.file_uploader("Upload", type=["pdf", "png", "jpg", "jpeg", "tif"])
+
+    # --- Execution ---
+    if st.button("🚀 Run Analysis") and uploaded_file:
+        progress = st.progress(0)
         file_bytes = uploaded_file.getvalue()
-        mime_type = uploaded_file.type
-
-    # --- 3. Run Analysis ---
-    if st.button("🚀 Run AI Analysis"):
-        if file_bytes and target_instructions_str:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        
+        with ThreadPoolExecutor() as executor:
+            future = executor.submit(call_gemini_vertex, file_bytes, uploaded_file.type, "\n".join(extracted_instructions), customer_overview, component_details)
+            progress.progress(50)
+            result_text = future.result()
+        
+        progress.progress(90)
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        
+        if json_match:
+            data_dict = json.loads(json_match.group(0))
+            st.session_state.last_result = data_dict
+            st.success("Analysis Complete!")
+            st.table([data_dict])
             
-            try:
-                start_time = time.time()
-                status_text.text("Initializing analysis...")
-                progress_bar.progress(10)
-
-                with ThreadPoolExecutor() as executor:
-                    status_text.text("Vertex AI is analyzing (us-central1)... Please wait.")
-                    progress_bar.progress(40)
-                    future = executor.submit(
-                        call_gemini_vertex, 
-                        file_bytes, mime_type, target_instructions_str, customer_overview, component_details
-                    )
-                    
-                    while not future.done():
-                        time.sleep(1)
-                        elapsed = time.time() - start_time
-                        if elapsed < 120:
-                            progress_bar.progress(min(40 + int(elapsed / 2), 90))
-                    
-                    result_text = future.result()
-
-                status_text.text("Processing results...")
-                progress_bar.progress(95)
-
-                st.subheader("3. Results")
-                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-                
-                if json_match:
-                    try:
-                        data_dict = json.loads(json_match.group(0))
-                        st.success(f"Analysis Complete in {int(time.time() - start_time)} seconds!")
-                        st.table([data_dict])
-                        with st.expander("Raw JSON Data"):
-                            st.json(data_dict)
-                    except:
-                        st.error("JSON parsing error.")
-                        st.text_area("Raw Response", result_text, height=300)
-                else:
-                    st.warning("No JSON data extracted.")
-                    st.text_area("Raw Response", result_text, height=300)
-
-                progress_bar.progress(100)
-                status_text.text("Done.")
-                
-            except Exception as e:
-                st.error(f"Execution Error: {str(e)}")
-                progress_bar.empty()
-                status_text.empty()
-        else:
-            st.warning("Please upload a file and define extraction items.")
-
+            # --- Export Options ---
+            st.divider()
+            st.subheader("📦 Export Results")
+            
+            # Local Excel Download
+            df = pd.DataFrame([data_dict])
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Result')
+            
+            st.download_button(
+                label="📥 Download as Excel (Local)",
+                data=output.getvalue(),
+                file_name=f"Drawing_Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Google Drive Auto Save
+            if st.button("☁️ Save to Google Drive (Spreadsheet)"):
+                with st.spinner("Uploading to Drive..."):
+                    sheet_url = save_to_google_sheets(creds, drive_folder_id, data_dict)
+                    if "https" in sheet_url:
+                        st.success(f"File created! [Open Spreadsheet]({sheet_url})")
+                    else:
+                        st.error(f"Failed to save to Drive: {sheet_url}")
+        
+        progress.progress(100)
