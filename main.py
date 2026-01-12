@@ -1,106 +1,130 @@
 import streamlit as st
 import google.generativeai as genai
 import json
-from PIL import Image
-import io
 
 # ==========================================
-# 1. セキュリティ設定（パスワード & APIキー）
+# 1. Security Settings
 # ==========================================
 def check_password():
-    """簡易パスワード認証（公開範囲のコントロール）"""
+    """Simple password authentication for access control"""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
 
     if not st.session_state["password_correct"]:
-        password = st.sidebar.text_input("パスワードを入力してください", type="password")
-        if password == st.secrets.get("APP_PASSWORD", "admin123"): # Secretsで設定
-            st.session_state["password_correct"] = True
-            st.rerun()
-        else:
-            st.warning("パスワードが正しくありません")
-            return False
+        st.title("🔒 Access Restricted")
+        password = st.text_input("Please enter the application password", type="password")
+        if st.button("Login"):
+            if password == st.secrets.get("APP_PASSWORD", "admin123"):
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        return False
     return True
 
-# APIキーの設定（Streamlit CloudのSecretsに設定しておく）
+# Configure Gemini API
 if "GEMINI_API_KEY" in st.secrets:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 else:
-    st.error("APIキーが設定されていません。")
+    st.error("API Key not found in Secrets.")
 
 # ==========================================
-# 2. メインロジック（図面解析）
+# 2. Main Logic (Drawing Analysis)
 # ==========================================
-def analyze_drawing(image, target_columns):
-    """Geminiを使用して図面から情報を抽出する"""
+def analyze_drawing(file_bytes, mime_type, target_columns, customer_info, component_info):
+    """Extracts information from drawings using Gemini 1.5 Pro"""
     model = genai.GenerativeModel('gemini-1.5-pro')
     
-    # 抽出したいカラムをプロンプトに組み込む
+    # Enhanced prompt including Customer and Component context
     prompt = f"""
-    この図面から以下の情報を抽出して、JSON形式で出力してください。
-    抽出項目: {target_columns}
+    Context:
+    - Customer Overview: {customer_info}
+    - Component Details (Harness/Connectors/etc.): {component_info}
+
+    Task:
+    Analyze the attached drawing and extract the following information in JSON format.
+    Required Columns: {target_columns}
     
-    出力フォーマット例:
-    {{
-        "項目名1": "値1",
-        "項目名2": "値2"
-    }}
+    Instructions:
+    - If a value is not found, return null.
+    - Return ONLY the JSON object.
     """
     
-    response = model.generate_content([prompt, image])
+    # Structure for Gemini API
+    content = [
+        {"mime_type": mime_type, "data": file_bytes},
+        prompt
+    ]
+    
+    response = model.generate_content(content)
     return response.text
 
 # ==========================================
-# 3. UI 構築
+# 3. UI Construction
 # ==========================================
-st.set_page_config(page_title="図面情報構造化ツール", layout="wide")
+st.set_page_config(page_title="AI Drawing Analyzer", layout="wide")
 
 if check_password():
-    st.title("📄 図面情報 構造化ツール")
-    st.write("図面から特定の情報を抽出し、構造化データ（JSON/表形式）に変換します。")
+    st.title("📄 AI Drawing Data Structurizer")
+    st.write("Extract structured data from technical drawings (PDF, TIFF, Images) using Google Gemini.")
 
-    # サイドバー：設定
-    st.sidebar.header("設定")
-    input_method = st.sidebar.radio("インプット方法を選択", ("ローカルからアップロード", "Google Driveパス指定"))
+    # Sidebar: Configurations
+    st.sidebar.header("Configuration")
+    input_method = st.sidebar.radio("Input Method", ("Local Upload", "Google Drive Path"))
     
+    st.sidebar.subheader("Extraction Settings")
     target_columns = st.sidebar.text_area(
-        "抽出するカラムを指定（カンマ区切り）",
-        "図番, 品名, 材質, 表面処理, 最大寸法, メーカー"
+        "Target Columns (Comma separated)",
+        "Part Number, Rev, Material, Manufacturer, Connector Type, Wire Gauge, Pin Count"
     )
 
-    # メインエリア：ファイル入力
-    img_content = None
-    
-    if input_method == "ローカルからアップロード":
-        uploaded_file = st.file_uploader("図面（画像/PDF）をアップロードしてください", type=["png", "jpg", "jpeg"])
+    # Main Area: Inputs
+    col1, col2 = st.columns(2)
+    with col1:
+        customer_overview = st.text_input("Customer Overview", placeholder="e.g., Automotive OEM, Aerospace client")
+    with col2:
+        component_details = st.text_input("Component Context", placeholder="e.g., Wire Harness, ECU Connector")
+
+    file_to_process = None
+    mime_type = None
+
+    if input_method == "Local Upload":
+        uploaded_file = st.file_uploader(
+            "Upload Drawing", 
+            type=["png", "jpg", "jpeg", "pdf", "tif", "tiff"]
+        )
         if uploaded_file:
-            img_content = Image.open(uploaded_file)
-            st.image(img_content, caption="アップロードされた図面", width=400)
+            file_to_process = uploaded_file.getvalue()
+            mime_type = uploaded_file.type
+            st.success(f"File '{uploaded_file.name}' ready for processing.")
 
     else:
-        drive_path = st.text_input("Google DriveのフォルダパスまたはファイルIDを入力してください")
-        st.info("※Google Drive連携には、別途Google Drive APIの認証(Service Account等)が必要です。")
-        # ここにGoogle DriveからファイルをDLする関数を呼び出す処理を記述
+        drive_path = st.text_input("Enter Google Drive Folder Path or File ID")
+        st.info("Note: Google Drive integration requires Service Account credentials setup.")
 
-    # 解析実行
-    if st.button("構造化を実行する") and img_content:
-        with st.spinner("解析中..."):
+    # Execution
+    if st.button("Run Extraction") and file_to_process:
+        with st.spinner("Analyzing drawing with Gemini..."):
             try:
-                result_text = analyze_drawing(img_content, target_columns)
+                result_text = analyze_drawing(
+                    file_to_process, 
+                    mime_type, 
+                    target_columns, 
+                    customer_overview, 
+                    component_details
+                )
                 
-                # 結果表示
-                st.subheader("解析結果")
-                st.code(result_text, language='json')
+                st.subheader("Extraction Result")
                 
-                # JSONとしてパースできれば表形式で表示
-                # (マークダウン内のJSONを抽出する処理が必要な場合があります)
+                # Clean and parse JSON
                 try:
-                    # 前後のマークダウン（```json ... ```）を削除してパース
                     clean_json = result_text.strip().replace("```json", "").replace("```", "")
                     data_dict = json.loads(clean_json)
                     st.table([data_dict])
+                    st.json(data_dict)
                 except:
-                    st.warning("解析結果を表形式に変換できませんでした。テキストを確認してください。")
+                    st.text_area("Raw AI Response", result_text, height=300)
+                    st.warning("Could not parse result into a table. Check the raw text above.")
                     
             except Exception as e:
-                st.error(f"エラーが発生しました: {e}")
+                st.error(f"Error during analysis: {e}")
