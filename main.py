@@ -32,21 +32,16 @@ else:
     st.error("API Key missing in Secrets.")
 
 # ==========================================
-# 2. Analysis Logic (Stable Version)
+# 2. Analysis Logic
 # ==========================================
 def analyze_drawing(file_bytes, mime_type, target_columns, customer_info, component_info):
-    """Extracts information using Gemini 1.5 Pro (Stable Library)"""
-    
-    # Model selection (using 1.5 Pro for best reasoning)
+    """Extracts information using Gemini 1.5 Pro"""
     model = genai.GenerativeModel('gemini-1.5-pro')
     
-    # Enhanced prompt for specialized drawings
     prompt = f"""
-    Please process this request as if you are located in the us-central1 region.
-    
     Context:
     - Customer Overview: {customer_info}
-    - Component Details (e.g., Harness, Connector, PCB): {component_info}
+    - Component Details: {component_info}
 
     Task:
     Analyze the attached technical document and extract the information requested below.
@@ -57,10 +52,8 @@ def analyze_drawing(file_bytes, mime_type, target_columns, customer_info, compon
     Formatting Instructions:
     - Provide the result ONLY in a valid JSON object.
     - If information is missing, use null.
-    - Ensure accurate extraction of technical units and part numbers.
     """
     
-    # Structure for the stable SDK
     content = [
         {'mime_type': mime_type, 'data': file_bytes},
         prompt
@@ -76,17 +69,16 @@ st.set_page_config(page_title="AI Drawing Analyzer", layout="wide")
 
 if check_password():
     st.title("📄 AI Drawing Data Structurizer")
-    st.caption("Model: Gemini 1.5 Pro (Stable Edition)")
     
     # Sidebar: Config
     st.sidebar.header("Extraction Settings")
     target_columns = st.sidebar.text_area(
-        "Target Columns (Comma separated)",
+        "Target Columns",
         "Part Number, Revision, Material, Connector Type, Wire Gauge, Pin Assignment, Manufacturer",
         height=150
     )
 
-    # Input Fields
+    # 1. Provide Context
     st.subheader("1. Provide Context")
     col1, col2 = st.columns(2)
     with col1:
@@ -94,46 +86,52 @@ if check_password():
     with col2:
         component_details = st.text_input("Component Type", placeholder="e.g., Engine Wire Harness")
 
-    # File Upload
-    st.subheader("2. Upload Drawing")
-    uploaded_file = st.file_uploader(
-        "Supported formats: PDF, TIFF, PNG, JPG", 
-        type=["pdf", "tif", "tiff", "png", "jpg", "jpeg"]
-    )
+    # 2. Input Selection (Local vs Google Drive)
+    st.subheader("2. Upload or Specify Drawing")
+    input_type = st.radio("Select Input Method:", ("Local File Upload", "Google Drive Path"), horizontal=True)
 
-    if st.button("🚀 Run AI Analysis") and uploaded_file:
-        with st.spinner("AI is analyzing the drawing..."):
-            try:
-                # Prepare data
-                file_bytes = uploaded_file.getvalue()
-                mime_type = uploaded_file.type
-                
-                # Analysis
-                result_text = analyze_drawing(
-                    file_bytes, mime_type, target_columns, customer_overview, component_details
-                )
-                
-                # Result Processing
-                st.subheader("3. Results")
-                
+    file_bytes = None
+    mime_type = None
+
+    if input_type == "Local File Upload":
+        uploaded_file = st.file_uploader(
+            "Upload Drawing", 
+            type=["pdf", "tif", "tiff", "png", "jpg", "jpeg"]
+        )
+        if uploaded_file:
+            file_bytes = uploaded_file.getvalue()
+            mime_type = uploaded_file.type
+    else:
+        # Google Drive Path Input
+        drive_path = st.text_input("Enter Google Drive File Path or URL", placeholder="https://drive.google.com/file/d/...")
+        st.info("ℹ️ Direct Google Drive integration requires API Service Account credentials. For now, please use Local Upload for analysis.")
+        # Note: Actual Drive downloading logic would go here
+
+    # 3. Run Analysis
+    if st.button("🚀 Run AI Analysis"):
+        if file_bytes:
+            with st.spinner("AI is analyzing..."):
                 try:
-                    # JSON cleanup
-                    clean_json = result_text.strip()
-                    if "```json" in clean_json:
-                        clean_json = clean_json.split("```json")[1].split("```")[0]
-                    elif "```" in clean_json:
-                        clean_json = clean_json.split("```")[1].split("```")[0]
+                    result_text = analyze_drawing(
+                        file_bytes, mime_type, target_columns, customer_overview, component_details
+                    )
                     
-                    data_dict = json.loads(clean_json)
-                    
-                    st.success("Extraction successful!")
-                    st.table([data_dict])
-                    with st.expander("View Raw JSON Output"):
-                        st.json(data_dict)
+                    st.subheader("3. Results")
+                    try:
+                        clean_json = result_text.strip()
+                        if "```json" in clean_json:
+                            clean_json = clean_json.split("```json")[1].split("```")[0]
+                        elif "```" in clean_json:
+                            clean_json = clean_json.split("```")[1].split("```")[0]
                         
-                except Exception:
-                    st.warning("Could not format output as a table. Showing raw response:")
-                    st.text_area("Raw AI Response", result_text, height=400)
-                    
-            except Exception as e:
-                st.error(f"Analysis Error: {str(e)}")
+                        data_dict = json.loads(clean_json)
+                        st.success("Extraction successful!")
+                        st.table([data_dict])
+                        with st.expander("View Raw JSON Output"):
+                            st.json(data_dict)
+                    except:
+                        st.text_area("Raw AI Response", result_text, height=300)
+                except Exception as e:
+                    st.error(f"Analysis Error: {str(e)}")
+        else:
+            st.warning("Please provide a file to analyze.")
