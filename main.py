@@ -13,55 +13,63 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# 1. 認証とVertex AIの初期化 (Scopesの統合)
+# 1. 統合認証 (Vertex AI + Drive + Sheets)
 # ==========================================
 @st.cache_resource
 def get_unified_credentials():
+    """Vertex AIとGoogle Drive/Sheetsの両方の権限を持つ認証情報を構築"""
     try:
         if "gcp_service_account" not in st.secrets:
-            st.error("Streamlit Secrets 'gcp_service_account' is missing.")
+            st.error("Secrets 'gcp_service_account' is missing.")
             return None
             
         info = dict(st.secrets["gcp_service_account"])
-        # 改行コードの処理を参考コードに合わせて実装
+        # 改行コードの置換（エラー防止）
         if "private_key" in info:
             info["private_key"] = info["private_key"].replace('\\n', '\n')
             
-        # 参考コードにある scopes をそのまま適用
+        # 参考コードに基づき、すべての権限スコープを統合
         scopes = [
-            'https://www.googleapis.com/auth/cloud-platform', 
-            'https://www.googleapis.com/auth/drive', 
-            'https://www.googleapis.com/auth/spreadsheets'
+            'https://www.googleapis.com/auth/cloud-platform', # Vertex AI用
+            'https://www.googleapis.com/auth/drive',         # Google Drive用
+            'https://www.googleapis.com/auth/spreadsheets'    # Google Sheets用
         ]
         
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
         
-        # Vertex AIの初期化
+        # Vertex AIの初期化を同時に実行
         vertexai.init(project=info["project_id"], location="us-central1", credentials=creds)
         
         return creds
     except Exception as e:
-        st.error(f"🚨 Authentication Error: {e}")
+        st.error(f"Authentication Error: {e}")
         return None
 
 # ==========================================
-# 2. Google Drive Helpers (API経由)
+# 2. Google Drive Helpers (URL解析機能付き)
 # ==========================================
+def extract_folder_id(input_str):
+    """URLやパラメータ付きIDから純粋なフォルダIDのみを抽出"""
+    if not input_str: return ""
+    # URLからID部分を抽出
+    match = re.search(r'folders/([a-zA-Z0-9_-]+)', input_str)
+    if match: return match.group(1)
+    # パラメータ(?ths=true等)を除去
+    return input_str.split('?')[0].strip()
+
 def list_files_in_folder(creds, folder_id):
-    """フォルダ内の図面ファイルをリストアップ"""
     try:
         service = build('drive', 'v3', credentials=creds)
-        # IDからURLパラメータ(ths=true等)を除去
-        clean_id = folder_id.split('/')[-1].split('?')[0]
+        clean_id = extract_folder_id(folder_id)
+        # フォルダ内スキャン
         query = f"'{clean_id}' in parents and trashed = false and (mimeType contains 'image/' or mimeType = 'application/pdf' or mimeType contains 'tiff')"
         results = service.files().list(q=query, fields="files(id, name, mimeType)").execute()
         return results.get('files', [])
     except Exception as e:
-        st.error(f"🚨 Google Drive Access Error: {str(e)}")
+        st.error(f"Google Drive Access Error: {str(e)}")
         return []
 
 def download_file(creds, file_id):
-    """API経由でファイルをバイナリとしてダウンロード"""
     service = build('drive', 'v3', credentials=creds)
     request = service.files().get_media(fileId=file_id)
     fh = BytesIO()
@@ -72,21 +80,17 @@ def download_file(creds, file_id):
     return fh.getvalue()
 
 def create_multi_sheet_spreadsheet(creds, folder_id, result_df, evidence_df):
-    """結果を2シートのスプレッドシートとして保存"""
     drive_service = build('drive', 'v3', credentials=creds)
     sheets_service = build('sheets', 'v4', credentials=creds)
-    clean_id = folder_id.split('/')[-1].split('?')[0]
+    clean_id = extract_folder_id(folder_id)
     
-    name = f"Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    name = f"Batch_Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M')}"
     meta = {'name': name, 'mimeType': 'application/vnd.google-apps.spreadsheet', 'parents': [clean_id]}
     ss = drive_service.files().create(body=meta, fields='id').execute()
     ss_id = ss.get('id')
     
-    # 2シート構成にする
-    sheets_service.spreadsheets().batchUpdate(
-        spreadsheetId=ss_id, 
-        body={'requests': [{'addSheet': {'properties': {'title': 'Evidence'}}}]}
-    ).execute()
+    # Evidenceシート追加
+    sheets_service.spreadsheets().batchUpdate(spreadsheetId=ss_id, body={'requests': [{'addSheet': {'properties': {'title': 'Evidence'}}}]}).execute()
     
     def upload(df, r):
         df_clean = df.fillna("")
@@ -98,16 +102,19 @@ def create_multi_sheet_spreadsheet(creds, folder_id, result_df, evidence_df):
     return f"https://docs.google.com/spreadsheets/d/{ss_id}/edit"
 
 # ==========================================
-# 3. AI Analysis logic
+# 3. AI Analysis Worker (Evidence in English)
 # ==========================================
 def process_single_file(creds, file_content, file_name, mime_type, target_inst, customer, component):
     try:
         model = GenerativeModel("gemini-2.5-pro")
         prompt = f"""
         Context: {customer}, {component}
-        Task: Extract data as JSON with evidence in ENGLISH.
-        Items: {target_inst}
-        Evidence Rule: Describe WHERE the info was found in English.
+        Task: Analyze the technical drawing and extract data.
+        Extraction Items: {target_inst}
+        
+        Rules for 'evidence':
+        - Describe WHERE in the drawing you found the info specifically in ENGLISH.
+        - Return ONLY a valid JSON: {{"results": {{...}}, "evidence": {{...}}}}
         """
         doc = Part.from_data(data=file_content, mime_type=mime_type)
         response = model.generate_content([doc, prompt])
@@ -120,19 +127,21 @@ def process_single_file(creds, file_content, file_name, mime_type, target_inst, 
         return None, None, f"{file_name}: {str(e)}"
 
 # ==========================================
-# 4. Streamlit UI
+# 4. Main UI
 # ==========================================
 st.set_page_config(page_title="AI Batch Drawing Analyzer", layout="wide")
 creds = get_unified_credentials()
 
 if creds:
-    st.title("📄 AI Drawing Data Structurizer")
-    
+    st.title("📄 AI Batch Drawing Analyzer")
+    st.caption("Engine: Gemini 2.5 Pro (Vertex AI) | Location: us-central1")
+
+    # 1. Extraction Settings
     st.subheader("1. Extraction Settings")
     c1, c2 = st.columns(2)
     with c1: customer = st.text_input("Customer Overview")
     with c2: component = st.text_input("Component Type")
-    
+
     if 'rows' not in st.session_state: st.session_state.rows = [{"item": "Part Number", "guide": "Title block"}]
     if st.button("➕ Add Item"): st.session_state.rows.append({"item": "", "guide": ""}); st.rerun()
     
@@ -142,41 +151,53 @@ if creds:
         it = r1.text_input(f"Item {i+1}", value=row['item'], key=f"it_{i}")
         gd = r2.text_input(f"Guide {i+1}", value=row['guide'], key=f"gd_{i}")
         if it: inst_list.append(f"- {it}: {gd}")
+    target_inst = "\n".join(inst_list)
 
+    # 2. Input
     st.subheader("2. Select Input Method")
-    input_type = st.radio("Source", ("Local Upload", "Google Drive Folder"), horizontal=True)
+    input_type = st.radio("Input Source", ("Local Upload", "Google Drive Folder"), horizontal=True)
 
-    all_res, all_ev = [], []
+    if 'all_res' not in st.session_state: st.session_state.all_res = []
+    if 'all_ev' not in st.session_state: st.session_state.all_ev = []
 
+    # 3. Execution
     if input_type == "Local Upload":
         uploaded_file = st.file_uploader("Upload Drawing", type=["pdf", "png", "jpg", "jpeg", "tif", "tiff"])
         if st.button("🚀 Run Local Analysis") and uploaded_file:
+            st.session_state.all_res, st.session_state.all_ev = [], []
             with st.spinner("Analyzing..."):
-                res, ev, err = process_single_file(creds, uploaded_file.getvalue(), uploaded_file.name, uploaded_file.type, "\n".join(inst_list), customer, component)
-                if res: all_res.append(res); all_ev.append(ev)
+                res, ev, err = process_single_file(creds, uploaded_file.getvalue(), uploaded_file.name, uploaded_file.type, target_inst, customer, component)
+                if res:
+                    st.session_state.all_res.append(res); st.session_state.all_ev.append(ev)
                 else: st.error(err)
     else:
-        folder_id = st.text_input("Google Drive Folder ID (e.g. 1WDoyc...)")
-        if st.button("🚀 Run Batch Analysis") and folder_id:
-            files = list_files_in_folder(creds, folder_id)
+        folder_input = st.text_input("Google Drive Folder ID / URL")
+        if st.button("🚀 Run Batch Analysis") and folder_input:
+            st.session_state.all_res, st.session_state.all_ev = [], []
+            files = list_files_in_folder(creds, folder_input)
             if files:
-                st.info(f"Found {len(files)} files. Analyzing in parallel...")
-                progress = st.progress(0)
+                total = len(files)
+                progress_bar = st.progress(0)
                 status_text = st.empty()
                 with ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {executor.submit(process_single_file, creds, download_file(creds, f['id']), f['name'], f['mimeType'], "\n".join(inst_list), customer, component): f for f in files}
+                    futures = {executor.submit(process_single_file, creds, download_file(creds, f['id']), f['name'], f['mimeType'], target_inst, customer, component): f for f in files}
                     for i, future in enumerate(as_completed(futures)):
                         res, ev, err = future.result()
-                        if res: all_res.append(res); all_ev.append(ev)
-                        progress.progress((i + 1) / len(files))
-                        status_text.text(f"Processed: {i+1}/{len(files)}")
+                        if res:
+                            st.session_state.all_res.append(res); st.session_state.all_ev.append(ev)
+                        progress_bar.progress((i + 1) / total)
+                        status_text.text(f"Processed: {i+1}/{total} files")
             else:
-                st.warning("No files found or access denied. Ensure the folder is shared with the Service Account.")
+                st.warning("No files found. Please ensure the folder is shared with the Service Account.")
 
-    if all_res:
-        df_res, df_ev = pd.DataFrame(all_res), pd.DataFrame(all_ev)
+    # 4. Export
+    if st.session_state.all_res:
+        df_res, df_ev = pd.DataFrame(st.session_state.all_res), pd.DataFrame(st.session_state.all_ev)
         st.success("Analysis Complete!")
+        st.write("### 📊 Result Sheet")
         st.table(df_res)
+        st.write("### 🔍 Evidence Sheet (English)")
+        st.table(df_ev)
         
         st.divider()
         e1, e2 = st.columns(2)
@@ -185,9 +206,9 @@ if creds:
             with pd.ExcelWriter(out, engine='openpyxl') as writer:
                 df_res.to_excel(writer, index=False, sheet_name='Results')
                 df_ev.to_excel(writer, index=False, sheet_name='Evidence')
-            st.download_button("📥 Download Excel", out.getvalue(), "Analysis_Report.xlsx")
+            st.download_button("📥 Download Excel (2 Sheets)", out.getvalue(), "Drawing_Analysis.xlsx")
         with e2:
             if input_type == "Google Drive Folder" and st.button("☁️ Save to Google Drive"):
                 with st.spinner("Saving..."):
-                    url = create_multi_sheet_spreadsheet(creds, folder_id, df_res, df_ev)
+                    url = create_multi_sheet_spreadsheet(creds, folder_input, df_res, df_ev)
                     st.success(f"Saved! [Open Spreadsheet]({url})")
